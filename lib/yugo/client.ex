@@ -104,13 +104,20 @@ defmodule Yugo.Client do
 
   @common_connect_opts [packet: :line, active: :once, mode: :binary]
 
-  defp ssl_opts(server, ssl_verify),
-    do:
-      [
-        server_name_indication: server,
-        verify: ssl_verify,
-        cacerts: :public_key.cacerts_get()
-      ] ++ @common_connect_opts
+  defp ssl_opts(server, ssl_verify) do
+    key = :"#{server}"
+
+    more_opts =
+      Application.get_env(:yugo, :ssl_opts, [])
+      |> Keyword.get(key, [])
+
+    ([
+       server_name_indication: server,
+       verify: ssl_verify,
+       cacerts: :public_key.cacerts_get()
+     ] ++ @common_connect_opts)
+    |> Keyword.merge(more_opts)
+  end
 
   @impl true
   def init(args) do
