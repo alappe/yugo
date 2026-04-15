@@ -168,6 +168,15 @@ defmodule Yugo.Parser do
         num = String.to_integer(num)
         [expunge: num]
 
+      Regex.match?(~r/^\d+ FETCH /is, resp) and resp =~ "BODYSTRUCTURE" ->
+        [seqnum, fetchdata] =
+          Regex.run(~r/^(\d+) FETCH \((.*)\)$/is, resp, capture: :all_but_first)
+
+        seqnum = String.to_integer(seqnum)
+
+        parse_msg_atts(fetchdata)
+        |> Enum.map(fn {attr, value} -> {:fetch, {seqnum, attr, value}} end)
+
       Regex.match?(~r/^\d+ FETCH /is, resp) ->
         [seqnum, fetchdata] =
           Regex.run(~r/^(\d+) FETCH \((.*)\)$/is, resp, capture: :all_but_first)
@@ -224,6 +233,7 @@ defmodule Yugo.Parser do
 
   defp parse_one_att(rest) do
     [name, rest] = Regex.run(~r/^ ?(\S+) (.*)$/is, rest, capture: :all_but_first)
+
     name = String.upcase(name)
 
     cond do
@@ -271,6 +281,9 @@ defmodule Yugo.Parser do
         {uid, rest} = parse_number(rest)
         {{:uid, uid}, rest}
 
+      name == "BODYSTRUCTURE" ->
+        parse_bodystructure(rest)
+
       Regex.match?(~r/BODY\[/, name) ->
         [body_number] = Regex.run(~r/BODY\[([0-9.]+)\]/, name, capture: :all_but_first)
 
@@ -281,6 +294,189 @@ defmodule Yugo.Parser do
 
         {content, rest} = parse_string(rest)
         {{:body_content, {body_number, content}}, rest}
+    end
+  end
+
+  # Parse BODYSTRUCTURE response - similar to parse_body but with extension data
+  # BODYSTRUCTURE includes: md5, disposition, language, location
+  defp parse_bodystructure(<<"((", _::binary>> = rest) do
+    <<?(, rest::binary>> = rest
+    {result, <<?), rest::binary>>} = parse_bodystructure_type_mpart(rest)
+    {result, rest}
+  end
+
+  defp parse_bodystructure(rest), do: parse_bodystructure_type_1part(rest)
+
+  defp parse_bodystructure_type_mpart(rest), do: parse_bodystructure_type_mpart_aux(rest, [])
+
+  defp parse_bodystructure_type_mpart_aux(<<?\s, rest::binary>>, acc) do
+    # After the parts: "subtype" [params [disposition [language [location]]]]
+    {_media_subtype, rest} = parse_string(rest)
+
+    # Parse optional multipart extension data
+    {_ext_data, rest} = parse_mpart_ext(rest, %{})
+
+    {{:body_structure, {:multipart, acc}}, rest}
+  end
+
+  defp parse_bodystructure_type_mpart_aux(rest, acc) do
+    {{:body_structure, body}, rest} = parse_bodystructure(rest)
+    parse_bodystructure_type_mpart_aux(rest, acc ++ [body])
+  end
+
+  # Parse multipart extension data: params [disposition [language [location]]]
+  defp parse_mpart_ext(<<?), _::binary>> = rest, acc), do: {acc, rest}
+
+  defp parse_mpart_ext(<<?\s, rest::binary>>, acc) do
+    {params, rest} = parse_body_fld_param(rest)
+    acc = Map.put(acc, :params, Map.new(params))
+    parse_mpart_ext_disposition(rest, acc)
+  end
+
+  defp parse_mpart_ext_disposition(<<?), _::binary>> = rest, acc), do: {acc, rest}
+
+  defp parse_mpart_ext_disposition(<<?\s, rest::binary>>, acc) do
+    {disposition, rest} = parse_disposition(rest)
+    acc = add_filename_from_disposition(disposition, acc)
+    parse_mpart_ext_language(rest, acc)
+  end
+
+  defp add_filename_from_disposition(%{params: %{"filename" => f}}, acc) do
+    Map.update(acc, :params, %{"name" => f}, fn p -> Map.put(p, "name", f) end)
+  end
+
+  defp add_filename_from_disposition(_, acc), do: acc
+
+  defp parse_mpart_ext_language(<<?), _::binary>> = rest, acc), do: {acc, rest}
+
+  defp parse_mpart_ext_language(<<?\s, rest::binary>>, acc) do
+    {language, rest} = parse_nstring_or_list(rest)
+    acc = Map.put(acc, :language, language)
+    parse_mpart_ext_location(rest, acc)
+  end
+
+  defp parse_mpart_ext_location(<<?), _::binary>> = rest, acc), do: {acc, rest}
+
+  defp parse_mpart_ext_location(<<?\s, rest::binary>>, acc) do
+    {location, rest} = parse_nstring(rest)
+    {Map.put(acc, :location, location), rest}
+  end
+
+  defp parse_bodystructure_type_1part(<<?(, rest::binary>>) do
+    # Parse required fields manually: type subtype params id desc enc octets
+    {mime1, <<?\s, rest::binary>>} = parse_string(rest)
+    {mime2, <<?\s, rest::binary>>} = parse_string(rest)
+    {params, <<?\s, rest::binary>>} = parse_body_fld_param(rest)
+    {id, <<?\s, rest::binary>>} = parse_nstring(rest)
+    {desc, <<?\s, rest::binary>>} = parse_nstring(rest)
+    {enc, <<?\s, rest::binary>>} = parse_string(rest)
+    {octets, rest} = parse_number(rest)
+
+    mime_type = "#{String.downcase(mime1)}/#{String.downcase(mime2)}"
+    is_text = String.downcase(mime1) == "text"
+
+    # For text types, parse the lines field
+    {lines, rest} =
+      if is_text do
+        case rest do
+          <<?\s, rest::binary>> -> parse_number(rest)
+          _ -> {nil, rest}
+        end
+      else
+        {nil, rest}
+      end
+
+    # Parse extension data: md5 [disposition [language [location]]]
+    {ext_data, rest} = parse_1part_ext(rest, %{})
+
+    # Consume closing paren
+    <<?), rest::binary>> = rest
+
+    body_structure = %{
+      mime_type: mime_type,
+      encoding: String.upcase(enc),
+      params: Map.new(params) |> Map.merge(ext_data[:params] || %{}),
+      id: id,
+      description: desc,
+      octets: octets,
+      lines: lines
+    }
+
+    {{:body_structure, {:onepart, body_structure}}, rest}
+  end
+
+  # Parse single-part extension data: md5 [disposition [language [location]]]
+  defp parse_1part_ext(<<?), _::binary>> = rest, acc), do: {acc, rest}
+
+  defp parse_1part_ext(<<?\s, rest::binary>>, acc) do
+    {md5, rest} = parse_nstring(rest)
+    acc = Map.put(acc, :md5, md5)
+    parse_1part_ext_disposition(rest, acc)
+  end
+
+  defp parse_1part_ext_disposition(<<?), _::binary>> = rest, acc), do: {acc, rest}
+
+  defp parse_1part_ext_disposition(<<?\s, rest::binary>>, acc) do
+    {disposition, rest} = parse_disposition(rest)
+    acc = add_filename_from_disposition(disposition, acc)
+    parse_1part_ext_language(rest, acc)
+  end
+
+  defp parse_1part_ext_language(<<?), _::binary>> = rest, acc), do: {acc, rest}
+
+  defp parse_1part_ext_language(<<?\s, rest::binary>>, acc) do
+    {language, rest} = parse_nstring_or_list(rest)
+    acc = Map.put(acc, :language, language)
+    parse_1part_ext_location(rest, acc)
+  end
+
+  defp parse_1part_ext_location(<<?), _::binary>> = rest, acc), do: {acc, rest}
+
+  defp parse_1part_ext_location(<<?\s, rest::binary>>, acc) do
+    {location, rest} = parse_nstring(rest)
+    {Map.put(acc, :location, location), rest}
+  end
+
+  # Parse body-fld-param: NIL or ("key" "value" ...)
+  defp parse_body_fld_param(rest) do
+    if Regex.match?(~r/^NIL/is, rest) do
+      <<_::binary-size(3), rest::binary>> = rest
+      {[], rest}
+    else
+      parse_variable_length_list(rest, &parse_string_pair/1)
+    end
+  end
+
+  # Parse disposition: NIL or ("type" ("param" "value" ...))
+  defp parse_disposition(rest) do
+    if Regex.match?(~r/^NIL/is, rest) do
+      <<_::binary-size(3), rest::binary>> = rest
+      {nil, rest}
+    else
+      {[disp_type, disp_params], rest} =
+        parse_list(rest, [&parse_string/1, &parse_body_fld_param/1])
+
+      disposition = %{
+        type: String.downcase(disp_type),
+        params: Map.new(disp_params)
+      }
+
+      {disposition, rest}
+    end
+  end
+
+  # Parse language: NIL, string, or list of strings
+  defp parse_nstring_or_list(rest) do
+    cond do
+      Regex.match?(~r/^NIL/is, rest) ->
+        <<_::binary-size(3), rest::binary>> = rest
+        {nil, rest}
+
+      String.starts_with?(rest, "(") ->
+        parse_variable_length_list(rest, &parse_string/1)
+
+      true ->
+        parse_string(rest)
     end
   end
 
@@ -299,6 +495,21 @@ defmodule Yugo.Parser do
     {parser_output, rest} = p.(rest)
     parse_list_aux(rest, parsers, [parser_output | acc], strict?)
   end
+
+  # Handle case where we have more data but no parsers left in lax mode - skip to end of list
+  # This is mostly relevant for body parts of type message/rfc822 i.e. when emails are forwarded.
+  # These body parts have additional fields, like a copy of the original envelope, which we don't parse.
+  defp parse_list_aux(rest, [], acc, :lax) do
+    rest = skip_to_end_of_list(rest, 0)
+    {Enum.reverse(acc), rest}
+  end
+
+  defp skip_to_end_of_list(<<?), rest::binary>>, 0), do: rest
+  defp skip_to_end_of_list(<<?(, rest::binary>>, depth), do: skip_to_end_of_list(rest, depth + 1)
+  defp skip_to_end_of_list(<<?), rest::binary>>, depth), do: skip_to_end_of_list(rest, depth - 1)
+
+  defp skip_to_end_of_list(<<_::binary-size(1), rest::binary>>, depth),
+    do: skip_to_end_of_list(rest, depth)
 
   defp parse_variable_length_list(<<?(, rest::binary>>, parser),
     do: parse_variable_length_list_aux(rest, parser, [])

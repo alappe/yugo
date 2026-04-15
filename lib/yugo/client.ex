@@ -267,16 +267,17 @@ defmodule Yugo.Client do
         :gen_tcp.connect(args[:server], args[:port], @common_connect_opts)
       end
 
-    conn = %Conn{
-      my_name: args[:name],
-      tls: args[:tls],
-      socket: socket,
-      server: args[:server],
-      username: args[:username],
-      password: args[:password],
-      mailbox: args[:mailbox],
-      ssl_verify: args[:ssl_verify]
-    }
+    conn =
+      %Conn{
+        my_name: args[:name],
+        tls: args[:tls],
+        socket: socket,
+        server: args[:server],
+        username: args[:username],
+        password: args[:password],
+        mailbox: args[:mailbox],
+        ssl_verify: args[:ssl_verify]
+      }
 
     {:noreply, conn}
   end
@@ -308,7 +309,7 @@ defmodule Yugo.Client do
   @impl true
   def handle_info({close_message, _sock}, conn)
       when close_message in [:tcp_closed, :ssl_closed] do
-    {:stop, :normal, conn}
+    {:stop, {:connection_closed, close_message}, conn}
   end
 
   @noop_poll_interval 5000
@@ -570,6 +571,11 @@ defmodule Yugo.Client do
         bodies
         |> Enum.with_index(1)
         |> Enum.flat_map(fn {b, idx} -> body_part_paths(b, [idx | path_acc]) end)
+
+      bodies when is_list(bodies) ->
+        bodies
+        |> Enum.with_index(1)
+        |> Enum.flat_map(fn {b, idx} -> body_part_paths(b, [idx | path_acc]) end)
     end
   end
 
@@ -641,7 +647,7 @@ defmodule Yugo.Client do
       |> Enum.reject(fn {key, _} -> Map.has_key?(conn.unprocessed_messages[seqnum], key) end)
       |> Enum.map(&elem(&1, 1))
 
-    parts_to_fetch = ["BODY"] ++ parts_to_fetch
+    parts_to_fetch = ["BODYSTRUCTURE"] ++ parts_to_fetch
 
     conn =
       conn
@@ -656,7 +662,8 @@ defmodule Yugo.Client do
   end
 
   defp fetch_message_body(conn, seqnum) do
-    msg = Map.get(conn.unprocessed_messages, seqnum)
+    msg =
+      Map.get(conn.unprocessed_messages, seqnum)
 
     body_parts =
       body_part_paths(msg.body_structure)
@@ -790,6 +797,17 @@ defmodule Yugo.Client do
           conn
         end
 
+      {:fetch, {seq_num, :body_structure, one_or_mpart}} ->
+        if Map.has_key?(conn.unprocessed_messages, seq_num) do
+          conn
+          |> put_in(
+            [Access.key!(:unprocessed_messages), seq_num, :body_structure],
+            one_or_mpart
+          )
+        else
+          conn
+        end
+
       {:fetch, {seq_num, :body_content, {body_number, content}}} ->
         msg = Map.get(conn.unprocessed_messages, seq_num)
 
@@ -834,13 +852,21 @@ defmodule Yugo.Client do
     do: conn |> apply_action(action) |> apply_actions(rest)
 
   defp send_raw(conn, stuff) do
-    if conn.tls do
-      :ssl.send(conn.socket, stuff)
-    else
-      :gen_tcp.send(conn.socket, stuff)
-    end
+    result =
+      if conn.tls do
+        :ssl.send(conn.socket, stuff)
+      else
+        :gen_tcp.send(conn.socket, stuff)
+      end
 
-    conn
+    case result do
+      :ok ->
+        conn
+
+      {:error, _} ->
+        # Terminate with error to trigger supervisor restart
+        throw({:connection_error, :send_failed})
+    end
   end
 
   defp send_command(conn, cmd, on_response \\ fn conn, _status, _text -> conn end) do

@@ -19,12 +19,9 @@ defmodule Helpers.Client do
 
   defp assert_comms_aux(socket, [line | rest]) do
     module =
-      case socket do
-        {:sslsocket, _, _} ->
-          :ssl
-
-        p when is_port(p) ->
-          :gen_tcp
+      cond do
+        is_tuple(socket) and elem(socket, 0) == :sslsocket -> :ssl
+        is_port(socket) -> :gen_tcp
       end
 
     case line do
@@ -125,7 +122,7 @@ defmodule Helpers.Client do
     socket
   end
 
-  defp accept_ssl(name \\ nil) do
+  defp accept_ssl(name) do
     {:ok, listener} =
       :ssl.listen(0,
         packet: :line,
