@@ -114,6 +114,33 @@ defmodule Yugo.ParserTest do
            ] = result
   end
 
+  test "parse FETCH (BODYSTRUCTURE) multipart with nested message/rfc822 (bounce)" do
+    result =
+      Parser.parse_response(
+        ~S|* 630 FETCH (FLAGS () UID 638 BODYSTRUCTURE (("text" "plain" ("charset" "us-ascii") NIL "Notification" "7bit" 623 16 NIL NIL NIL NIL)("message" "delivery-status" NIL NIL "Delivery report" "7bit" 463 NIL NIL NIL NIL)("message" "rfc822" NIL NIL "Undelivered Message" "7bit" 5034 ("Wed, 8 Jul 2026 17:49:04 +0000" "Ihre Anfrage" ((NIL NIL "entega" "corporatesponsoring.de")) ((NIL NIL "entega" "corporatesponsoring.de")) ((NIL NIL "entega" "corporatesponsoring.de")) ((NIL NIL "kontakt" "example.de")) NIL NIL NIL "<f47de0d213b3b60a835469b38b67d97a@e1c7cbbb73cd>") ("text" "plain" ("charset" "utf-8") NIL NIL "quoted-printable" 453 7 NIL NIL NIL NIL) 80 NIL NIL NIL NIL) "report" ("report-type" "delivery-status" "boundary" "4gwQZb2LSVz4vxk.1783532955/de-fra-smtpin14.hostinger.io") NIL NIL NIL) ENVELOPE ("Wed,  8 Jul 2026 17:49:15 +0000 (UTC)" "Undelivered Mail Returned to Sender" ((NIL NIL "MAILER-DAEMON" "de-fra-smtpin14.hostinger.io")) ((NIL NIL "MAILER-DAEMON" "de-fra-smtpin14.hostinger.io")) ((NIL NIL "MAILER-DAEMON" "de-fra-smtpin14.hostinger.io")) ((NIL NIL "entega" "corporatesponsoring.de")) NIL NIL NIL "<4gwQZg1FF7z50Fd@de-fra-smtpin14.hostinger.io>"))|
+      )
+
+    assert [
+             fetch: {630, :envelope, _envelope},
+             fetch:
+               {630, :body_structure,
+                {:multipart,
+                 [
+                   {:onepart, %{mime_type: "text/plain", octets: 623, lines: 16}},
+                   {:onepart, %{mime_type: "message/delivery-status", octets: 463}},
+                   {:onepart,
+                    %{
+                      mime_type: "message/rfc822",
+                      encoding: "7BIT",
+                      octets: 5034,
+                      lines: 80
+                    }}
+                 ]}},
+             fetch: {630, :uid, 638},
+             fetch: {630, :flags, []}
+           ] = result
+  end
+
   test "parse FETCH (BODYSTRUCTURE) simple text response" do
     result =
       Parser.parse_response(

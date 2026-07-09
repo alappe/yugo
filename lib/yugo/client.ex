@@ -125,9 +125,17 @@ defmodule Yugo.Client do
   end
 
   @impl true
+  def terminate(_reason, nil), do: :ok
+  def terminate({:connection_closed, _}, _conn), do: :ok
+
   def terminate(_reason, conn) do
-    conn
-    |> send_command("LOGOUT")
+    try do
+      send_command(conn, "LOGOUT")
+    catch
+      :throw, _ -> :ok
+    end
+
+    :ok
   end
 
   @impl true

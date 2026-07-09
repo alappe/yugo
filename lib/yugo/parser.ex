@@ -375,15 +375,28 @@ defmodule Yugo.Parser do
     mime_type = "#{String.downcase(mime1)}/#{String.downcase(mime2)}"
     is_text = String.downcase(mime1) == "text"
 
-    # For text types, parse the lines field
+    # For text types, parse the lines field. For message/rfc822 (body-type-msg)
+    # there are three extra fields after octets per RFC 3501:
+    #   SP envelope SP body SP body-fld-lines
+    # We skip the nested envelope and nested body-structure and read the line count.
     {lines, rest} =
-      if is_text do
-        case rest do
-          <<?\s, rest::binary>> -> parse_number(rest)
-          _ -> {nil, rest}
-        end
-      else
-        {nil, rest}
+      cond do
+        mime_type == "message/rfc822" ->
+          <<?\s, ?(, r::binary>> = rest
+          r = skip_to_end_of_list(r, 0)
+          <<?\s, ?(, r::binary>> = r
+          r = skip_to_end_of_list(r, 0)
+          <<?\s, r::binary>> = r
+          parse_number(r)
+
+        is_text ->
+          case rest do
+            <<?\s, rest::binary>> -> parse_number(rest)
+            _ -> {nil, rest}
+          end
+
+        true ->
+          {nil, rest}
       end
 
     # Parse extension data: md5 [disposition [language [location]]]
